@@ -214,6 +214,22 @@ async def process_scheduled_item(client: httpx.AsyncClient, item: dict) -> dict:
     return results
 
 
+async def cleanup_image(client: httpx.AsyncClient, url: str):
+    """Delete image from gemini-hub server after successful publish."""
+    if not url or "gemini-rag-api" not in url:
+        return  # Only clean up images hosted on our server
+    filename = url.split("/")[-1]
+    try:
+        r = await client.delete(f"{GEMINI_HUB_URL}/images/{filename}", timeout=10.0)
+        data = r.json()
+        if data.get("status") == "deleted":
+            logger.info(f"  Cleanup: {filename} deleted from server")
+        else:
+            logger.warning(f"  Cleanup: {filename} — {data}")
+    except Exception as e:
+        logger.warning(f"  Cleanup failed for {filename}: {e}")
+
+
 async def run_scheduler():
     """Check schedule and publish content for today."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -236,6 +252,17 @@ async def run_scheduler():
                 item["published_at"] = datetime.now(timezone.utc).isoformat()
                 item["results"] = results
                 logger.info(f"  Results: {json.dumps(results, default=str)[:200]}")
+
+                # Cleanup: delete images from server after successful publish
+                all_success = all(
+                    r.get("success", False) for r in results.values() if isinstance(r, dict)
+                )
+                if all_success:
+                    # Clean up all URLs used
+                    for url in [item.get("image_url", "")] + (item.get("image_urls") or []) + [item.get("video_url", "")]:
+                        if url:
+                            await cleanup_image(client, url)
+
             except Exception as e:
                 logger.error(f"  Error: {e}")
                 item["error"] = str(e)
