@@ -16,8 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+import base64
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -37,6 +38,30 @@ logger = logging.getLogger("scheduler")
 
 
 # ─── Schedule Data ───────────────────────────────────────────────
+
+async def upload_to_drive(file_bytes: bytes, filename: str, mime_type: str = "image/png") -> str:
+    """Upload file to Google Drive via gemini-hub and return permanent public URL."""
+    b64 = base64.standard_b64encode(file_bytes).decode("ascii")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Use MCP server's drive_upload via SSE/HTTP
+        r = await client.post(
+            f"{GEMINI_HUB_URL}/call/drive_upload",
+            json={
+                "filename": filename,
+                "content_base64": b64,
+                "mime_type": mime_type,
+                "make_public": True,
+            },
+        )
+        data = r.json()
+        file_id = data.get("id", "")
+        if file_id:
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        # Fallback: try the upload-image endpoint (temporary but works)
+        logger.warning(f"Drive upload failed: {data}. Using temporary server URL.")
+        return ""
+
 
 def load_schedule() -> list[dict]:
     if SCHEDULE_FILE.exists():
@@ -327,6 +352,57 @@ async def remove_from_schedule(index: int):
     removed = schedule.pop(index)
     save_schedule(schedule)
     return {"status": "removed", "item": removed.get("title", "")}
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload image to Google Drive and return permanent URL."""
+    content = await file.read()
+    filename = file.filename or "image.png"
+    ext = Path(filename).suffix.lower()
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "mp4": "video/mp4"}.get(ext.lstrip("."), "image/png")
+
+    url = await upload_to_drive(content, f"astrobot-{filename}", mime)
+    if not url:
+        raise HTTPException(500, "Failed to upload to Drive")
+    return {"url": url, "filename": filename, "size_bytes": len(content)}
+
+
+@app.post("/schedule-with-upload")
+async def schedule_with_upload(
+    file: UploadFile = File(...),
+    date: str = Form(...),
+    title: str = Form(...),
+    caption: str = Form(""),
+    type: str = Form("photo"),
+    platforms: str = Form("instagram,facebook"),
+):
+    """Upload image to Drive and schedule it in one step."""
+    content = await file.read()
+    filename = file.filename or "image.png"
+    ext = Path(filename).suffix.lower()
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext.lstrip("."), "image/png")
+
+    url = await upload_to_drive(content, f"astrobot-{date}-{title.replace(' ', '_')[:30]}{ext}", mime)
+    if not url:
+        raise HTTPException(500, "Failed to upload to Drive")
+
+    schedule = load_schedule()
+    entry = {
+        "date": date,
+        "title": title,
+        "type": type,
+        "caption": caption,
+        "image_url": url,
+        "image_urls": None,
+        "video_url": None,
+        "platforms": [p.strip() for p in platforms.split(",")],
+        "published": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    schedule.append(entry)
+    save_schedule(schedule)
+    return {"status": "uploaded_and_scheduled", "url": url, "date": date, "title": title}
 
 
 @app.post("/publish-now")
