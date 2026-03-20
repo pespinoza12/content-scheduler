@@ -5,10 +5,12 @@ Publishes pre-produced content to Instagram + Facebook on schedule.
 - Checks every hour if there's content to publish for today
 - Reads schedule from /data/schedule.json
 - Publishes photos, carousels, and reels
-- Marks items as published after success
-- Small FastAPI for health check + schedule management
+- Only marks items as published when ALL platforms succeed
+- Hosts media via MinIO (S3-compatible) for reliable direct URLs
+- Cleans up MinIO files after successful publish
 """
 import asyncio
+import io
 import json
 import logging
 import os
@@ -16,10 +18,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-import base64
 import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from minio import Minio
 from pydantic import BaseModel
 from typing import Optional
 
@@ -33,34 +35,72 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 GEMINI_HUB_URL = os.getenv("GEMINI_HUB_URL", "https://gemini-rag-api.pespinoza.online")
 
+# MinIO Config (S3-compatible object storage)
+MINIO_URL = os.getenv("MINIO_SERVER_URL", "minio.pespinoza.online")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ROOT_USER", "")
+MINIO_SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD", "")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "astrobot-content")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("scheduler")
 
+# MinIO client
+minio_client = None
+if MINIO_ACCESS_KEY and MINIO_SECRET_KEY:
+    try:
+        minio_client = Minio(MINIO_URL, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=True)
+        if not minio_client.bucket_exists(MINIO_BUCKET):
+            minio_client.make_bucket(MINIO_BUCKET)
+            # Set public read policy
+            policy = json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{MINIO_BUCKET}/*"]
+                }]
+            })
+            minio_client.set_bucket_policy(MINIO_BUCKET, policy)
+        logger.info(f"MinIO connected: {MINIO_URL}/{MINIO_BUCKET}")
+    except Exception as e:
+        logger.warning(f"MinIO setup failed: {e}")
+        minio_client = None
+else:
+    logger.warning("MinIO not configured — set MINIO_ROOT_USER and MINIO_ROOT_PASSWORD")
 
-# ─── Schedule Data ───────────────────────────────────────────────
 
-async def upload_to_drive(file_bytes: bytes, filename: str, mime_type: str = "image/png") -> str:
-    """Upload file to Google Drive via gemini-hub and return permanent public URL."""
-    b64 = base64.standard_b64encode(file_bytes).decode("ascii")
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Use MCP server's drive_upload via SSE/HTTP
-        r = await client.post(
-            f"{GEMINI_HUB_URL}/call/drive_upload",
-            json={
-                "filename": filename,
-                "content_base64": b64,
-                "mime_type": mime_type,
-                "make_public": True,
-            },
-        )
-        data = r.json()
-        file_id = data.get("id", "")
-        if file_id:
-            return f"https://drive.google.com/uc?export=download&id={file_id}"
+# ─── MinIO Upload/Cleanup ────────────────────────────────────────
 
-        # Fallback: try the upload-image endpoint (temporary but works)
-        logger.warning(f"Drive upload failed: {data}. Using temporary server URL.")
+def upload_to_minio(file_bytes: bytes, filename: str, content_type: str = "image/png") -> str:
+    """Upload file to MinIO and return permanent public URL."""
+    if not minio_client:
+        logger.error("MinIO not available — cannot upload")
         return ""
+    try:
+        data = io.BytesIO(file_bytes)
+        minio_client.put_object(MINIO_BUCKET, filename, data, len(file_bytes), content_type=content_type)
+        url = f"https://{MINIO_URL}/{MINIO_BUCKET}/{filename}"
+        logger.info(f"Uploaded to MinIO: {url}")
+        return url
+    except Exception as e:
+        logger.error(f"MinIO upload failed: {e}")
+        return ""
+
+
+def cleanup_minio(url: str):
+    """Delete file from MinIO after successful publish."""
+    if not minio_client or MINIO_URL not in url:
+        return
+    prefix = f"https://{MINIO_URL}/{MINIO_BUCKET}/"
+    if not url.startswith(prefix):
+        return
+    object_name = url[len(prefix):]
+    try:
+        minio_client.remove_object(MINIO_BUCKET, object_name)
+        logger.info(f"  Cleanup: {object_name} deleted from MinIO")
+    except Exception as e:
+        logger.warning(f"  MinIO cleanup failed for {object_name}: {e}")
 
 
 def load_schedule() -> list[dict]:
@@ -248,24 +288,30 @@ async def run_scheduler():
             logger.info(f"Publishing: {title}")
             try:
                 results = await process_scheduled_item(client, item)
-                item["published"] = True
-                item["published_at"] = datetime.now(timezone.utc).isoformat()
                 item["results"] = results
-                logger.info(f"  Results: {json.dumps(results, default=str)[:200]}")
+                logger.info(f"  Results: {json.dumps(results, default=str)[:500]}")
 
-                # Cleanup: delete images from server after successful publish
                 all_success = all(
                     r.get("success", False) for r in results.values() if isinstance(r, dict)
                 )
                 if all_success:
-                    # Clean up all URLs used
+                    item["published"] = True
+                    item["published_at"] = datetime.now(timezone.utc).isoformat()
+                    logger.info(f"  All platforms succeeded — marked as published")
+                    # Cleanup: delete media from MinIO and gemini-hub after success
                     for url in [item.get("image_url", "")] + (item.get("image_urls") or []) + [item.get("video_url", "")]:
                         if url:
+                            cleanup_minio(url)
                             await cleanup_image(client, url)
+                else:
+                    failed = [k for k, v in results.items() if isinstance(v, dict) and not v.get("success")]
+                    logger.warning(f"  Partial failure on: {failed} — will retry next cycle")
+                    item["last_attempt"] = datetime.now(timezone.utc).isoformat()
 
             except Exception as e:
                 logger.error(f"  Error: {e}")
                 item["error"] = str(e)
+                item["last_attempt"] = datetime.now(timezone.utc).isoformat()
             await asyncio.sleep(5)
 
     save_schedule(schedule)
@@ -383,15 +429,19 @@ async def remove_from_schedule(index: int):
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload image to Google Drive and return permanent URL."""
+    """Upload file to MinIO and return permanent direct URL."""
     content = await file.read()
     filename = file.filename or "image.png"
     ext = Path(filename).suffix.lower()
     mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "mp4": "video/mp4"}.get(ext.lstrip("."), "image/png")
 
-    url = await upload_to_drive(content, f"astrobot-{filename}", mime)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe_name = filename.replace(" ", "-").lower()
+    object_name = f"uploads/{timestamp}-{safe_name}"
+
+    url = upload_to_minio(content, object_name, mime)
     if not url:
-        raise HTTPException(500, "Failed to upload to Drive")
+        raise HTTPException(500, "Failed to upload to MinIO")
     return {"url": url, "filename": filename, "size_bytes": len(content)}
 
 
@@ -404,25 +454,31 @@ async def schedule_with_upload(
     type: str = Form("photo"),
     platforms: str = Form("instagram,facebook"),
 ):
-    """Upload image to Drive and schedule it in one step."""
+    """Upload file to MinIO and schedule it in one step."""
     content = await file.read()
     filename = file.filename or "image.png"
     ext = Path(filename).suffix.lower()
-    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext.lstrip("."), "image/png")
+    mime = {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "mp4": "video/mp4", "mov": "video/quicktime",
+    }.get(ext.lstrip("."), "image/png")
 
-    url = await upload_to_drive(content, f"astrobot-{date}-{title.replace(' ', '_')[:30]}{ext}", mime)
+    safe_title = title.replace(" ", "-").lower()[:30]
+    object_name = f"scheduled/{date}-{safe_title}{ext}"
+    url = upload_to_minio(content, object_name, mime)
     if not url:
-        raise HTTPException(500, "Failed to upload to Drive")
+        raise HTTPException(500, "Failed to upload to MinIO")
 
+    is_video = ext.lstrip(".") in ("mp4", "mov")
     schedule = load_schedule()
     entry = {
         "date": date,
         "title": title,
         "type": type,
         "caption": caption,
-        "image_url": url,
+        "image_url": None if is_video else url,
         "image_urls": None,
-        "video_url": None,
+        "video_url": url if is_video else None,
         "platforms": [p.strip() for p in platforms.split(",")],
         "published": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -451,9 +507,22 @@ async def publish_single(index: int):
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         results = await process_scheduled_item(client, item)
-        item["published"] = True
-        item["published_at"] = datetime.now(timezone.utc).isoformat()
         item["results"] = results
 
+        all_success = all(
+            r.get("success", False) for r in results.values() if isinstance(r, dict)
+        )
+        if all_success:
+            item["published"] = True
+            item["published_at"] = datetime.now(timezone.utc).isoformat()
+            # Cleanup media files
+            for url in [item.get("image_url", "")] + (item.get("image_urls") or []) + [item.get("video_url", "")]:
+                if url:
+                    cleanup_minio(url)
+                    await cleanup_image(client, url)
+        else:
+            item["last_attempt"] = datetime.now(timezone.utc).isoformat()
+
     save_schedule(schedule)
-    return {"status": "published", "results": results}
+    status = "published" if all_success else "partial_failure"
+    return {"status": status, "results": results}
